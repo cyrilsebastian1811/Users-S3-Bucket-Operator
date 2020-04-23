@@ -2,10 +2,14 @@ package appservice
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/go-logr/logr"
 
@@ -24,6 +28,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+type policyDocument struct {
+	Version   string
+	Statement []statementEntry
+}
+
+type statementEntry struct {
+	Effect    string
+	Action    []string
+	Resource  string
+	Condition json.RawMessage
+}
 
 var log = logf.Log.WithName("controller_appservice")
 
@@ -120,7 +136,7 @@ func (r *ReconcileAppService) Reconcile(request reconcile.Request) (reconcile.Re
 	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
 		reqLogger.Info("Creating new secret")
-		secret, err := r.newSecretForCR(instance)
+		secret, err := r.newSecretForCR(instance, reqLogger)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
@@ -165,8 +181,9 @@ func (r *ReconcileAppService) Reconcile(request reconcile.Request) (reconcile.Re
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileAppService) newSecretForCR(cr *appv1alpha1.AppService) (*corev1.Secret, error) {
-	err := createAWSResources(cr)
+func (r *ReconcileAppService) newSecretForCR(cr *appv1alpha1.AppService, reqLogger logr.Logger) (*corev1.Secret, error) {
+	reqLogger.Info("Creating AWS resources")
+	accessKey, err := createAWSResources(cr, reqLogger)
 	if err != nil {
 		return nil, err
 	}
@@ -180,26 +197,114 @@ func (r *ReconcileAppService) newSecretForCR(cr *appv1alpha1.AppService) (*corev
 			Namespace: cr.Namespace,
 			Labels:    labels,
 		},
+		StringData: map[string]string{
+			"aws_access_key_id":     *accessKey.AccessKeyId,
+			"aws_sceret_access_key": *accessKey.SecretAccessKey,
+		},
 	}
 
 	controllerutil.SetControllerReference(cr, secret, r.scheme)
 	return secret, nil
 }
 
-func createAWSResources(cr *appv1alpha1.AppService) error {
+func createAWSResources(cr *appv1alpha1.AppService, reqLogger logr.Logger) (*iam.AccessKey, error) {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String("us-east-1")})
 
-	svc := s3.New(sess)
-
 	bucket, _ := os.LookupEnv("S3_BUCKET")
 	folderName := cr.Spec.Username + "/"
+	reqLogger.Info("Creating S3 Bucket", "Bucket", bucket, "Key", folderName)
+	err = createS3Bucket(sess, bucket, folderName)
+	if err != nil {
+		return nil, err
+	}
 
-	_, err = svc.PutObject(&s3.PutObjectInput{
+	reqLogger.Info("Creating IAM resources", "Username", cr.Spec.Username)
+	accessKey, err := createIAMReources(sess, cr.Spec.Username, bucket)
+	if err != nil {
+		return nil, err
+	}
+
+	return accessKey, nil
+}
+
+func createS3Bucket(sess *session.Session, bucket string, folderName string) error {
+	svc := s3.New(sess)
+
+	_, err := svc.PutObject(&s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(folderName),
 	})
 	return err
+}
+
+func createIAMReources(sess *session.Session, username string, bucket string) (*iam.AccessKey, error) {
+	svc := iam.New(sess)
+
+	_, err := svc.GetUser(&iam.GetUserInput{UserName: aws.String(username)})
+
+	if awserr, ok := err.(awserr.Error); ok && awserr.Code() == iam.ErrCodeNoSuchEntityException {
+		_, err := svc.CreateUser(&iam.CreateUserInput{UserName: aws.String(username)})
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, err
+	}
+
+	policy := policyDocument{
+		Version: "2012-10-17",
+		Statement: []statementEntry{
+			statementEntry{
+				Effect: "Allow",
+				Action: []string{
+					"s3:ListBucket",
+				},
+				Resource:  fmt.Sprintf("arn:aws:s3:::%s", bucket),
+				Condition: json.RawMessage(fmt.Sprintf(`{"StringLike":{"s3:prefix":["%s/*"]}}`, username)),
+			},
+			statementEntry{
+				Effect: "Allow",
+				Action: []string{
+					"s3:PutObject",
+					"s3:GetObject",
+					"s3:DeleteObject",
+				},
+				Resource:  fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, username),
+				Condition: json.RawMessage(`{}`),
+			},
+		},
+	}
+
+	b, err := json.Marshal(&policy)
+	if err != nil {
+		return nil, err
+	}
+
+	policyResult, err := svc.CreatePolicy(&iam.CreatePolicyInput{
+		PolicyDocument: aws.String(string(b)),
+		PolicyName:     aws.String(fmt.Sprintf("%s-S3-Policy", username)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = svc.AttachUserPolicy(&iam.AttachUserPolicyInput{
+		UserName:  aws.String(username),
+		PolicyArn: policyResult.Policy.Arn,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	accessKeyOutput, err := svc.CreateAccessKey(&iam.CreateAccessKeyInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return accessKeyOutput.AccessKey, nil
 }
 
 func (r *ReconcileAppService) finalizeAppService(reqLogger logr.Logger, cr *appv1alpha1.AppService) error {
@@ -207,24 +312,88 @@ func (r *ReconcileAppService) finalizeAppService(reqLogger logr.Logger, cr *appv
 	// needs to do before the CR can be deleted. Examples
 	// of finalizers include performing backups and deleting
 	// resources that are not owned by this CR, like a PVC.
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String("us-east-1")})
-
-	svc := s3.New(sess)
 
 	bucket, _ := os.LookupEnv("S3_BUCKET")
 	folderName := cr.Spec.Username + "/"
+	reqLogger.Info("Deleting S3 bucket", "Bucket", bucket, "Key", folderName)
+	err := deleteS3Bucket(bucket, folderName)
+	if err != nil {
+		return err
+	}
 
-	_, err = svc.DeleteObject(&s3.DeleteObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(folderName),
-	})
+	reqLogger.Info("Deleting IAM resources", "UserName", cr.Spec.Username)
+	err = deleteIAMResources(cr.Spec.Username)
 	if err != nil {
 		return err
 	}
 
 	reqLogger.Info("Successfully finalized AppService")
 	return nil
+}
+
+func deleteS3Bucket(bucket string, key string) error {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("us-east-1")})
+
+	svc := s3.New(sess)
+
+	_, err = svc.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+
+	return err
+}
+
+func deleteIAMResources(username string) error {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("us-east-1")})
+
+	svc := iam.New(sess)
+
+	listAccessKeysOutput, _ := svc.ListAccessKeys(&iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	})
+	if listAccessKeysOutput != nil && len(listAccessKeysOutput.AccessKeyMetadata) > 0 {
+		for _, accessKey := range listAccessKeysOutput.AccessKeyMetadata {
+			_, err := svc.DeleteAccessKey(&iam.DeleteAccessKeyInput{
+				AccessKeyId: accessKey.AccessKeyId,
+				UserName:    aws.String(username),
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	result, _ := svc.ListAttachedUserPolicies(&iam.ListAttachedUserPoliciesInput{
+		UserName: aws.String(username),
+	})
+	if result != nil && len(result.AttachedPolicies) > 0 {
+		for _, policy := range result.AttachedPolicies {
+			policyArn := policy.PolicyArn
+
+			_, err := svc.DetachUserPolicy(&iam.DetachUserPolicyInput{
+				UserName:  aws.String(username),
+				PolicyArn: policyArn,
+			})
+			if err != nil {
+				return err
+			}
+
+			_, err = svc.DeletePolicy(&iam.DeletePolicyInput{
+				PolicyArn: policyArn,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err = svc.DeleteUser(&iam.DeleteUserInput{
+		UserName: aws.String(username),
+	})
+	return err
 }
 
 func (r *ReconcileAppService) addFinalizer(reqLogger logr.Logger, cr *appv1alpha1.AppService) error {
