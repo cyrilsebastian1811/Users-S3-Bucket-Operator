@@ -4,6 +4,6 @@ metadata:
   name: example-appservice
 spec:
   # Add fields here
-  username: suhas
+  username: suhpasri
   userSecret:
-    name: suhas-secret
+    name: suhpasri-secret
