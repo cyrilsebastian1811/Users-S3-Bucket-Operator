@@ -1,0 +1,9 @@
+apiVersion: app.example.com/v1alpha1
+kind: AppService
+metadata:
+  name: example-appservice
+spec:
+  # Add fields here
+  username: suhas
+  userSecret:
+    name: suhas-secret
