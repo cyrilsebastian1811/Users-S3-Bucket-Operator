@@ -135,6 +135,14 @@ func (r *ReconcileAppService) Reconcile(request reconcile.Request) (reconcile.Re
 	found := &corev1.Secret{}
 	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
+		reqLogger.Info("Set setupComplete to false")
+		instance.Status.SetupComplete = false
+		err := r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update AppService status")
+			return reconcile.Result{}, err
+		}
+
 		reqLogger.Info("Creating new secret")
 		secret, err := r.newSecretForCR(instance, reqLogger)
 		if err != nil {
@@ -144,6 +152,15 @@ func (r *ReconcileAppService) Reconcile(request reconcile.Request) (reconcile.Re
 		if err != nil {
 			return reconcile.Result{}, err
 		}
+
+		reqLogger.Info("Set setupComplete to true")
+		instance.Status.SetupComplete = true
+		err = r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update AppService status")
+			return reconcile.Result{}, err
+		}
+
 		return reconcile.Result{}, nil
 	}
 
@@ -188,6 +205,7 @@ func (r *ReconcileAppService) newSecretForCR(cr *appv1alpha1.AppService, reqLogg
 		return nil, err
 	}
 
+	reqLogger.Info("Creating new secret with aws keys")
 	labels := map[string]string{
 		"app": cr.Name,
 	}
@@ -220,7 +238,7 @@ func createAWSResources(cr *appv1alpha1.AppService, reqLogger logr.Logger) (*iam
 	}
 
 	reqLogger.Info("Creating IAM resources", "Username", cr.Spec.Username)
-	accessKey, err := createIAMReources(sess, cr.Spec.Username, bucket)
+	accessKey, err := createIAMReources(sess, cr.Spec.Username, bucket, reqLogger)
 	if err != nil {
 		return nil, err
 	}
@@ -231,72 +249,96 @@ func createAWSResources(cr *appv1alpha1.AppService, reqLogger logr.Logger) (*iam
 func createS3Bucket(sess *session.Session, bucket string, folderName string) error {
 	svc := s3.New(sess)
 
-	_, err := svc.PutObject(&s3.PutObjectInput{
+	result, _ := svc.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(folderName),
 	})
-	return err
+	if result.Body == nil {
+		_, err := svc.PutObject(&s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(folderName),
+		})
+		return err
+	}
+	return nil
 }
 
-func createIAMReources(sess *session.Session, username string, bucket string) (*iam.AccessKey, error) {
+func createIAMReources(sess *session.Session, username string, bucket string, logger logr.Logger) (*iam.AccessKey, error) {
 	svc := iam.New(sess)
 
+	logger.Info("Getting user", "UserName", username)
 	_, err := svc.GetUser(&iam.GetUserInput{UserName: aws.String(username)})
 
 	if awserr, ok := err.(awserr.Error); ok && awserr.Code() == iam.ErrCodeNoSuchEntityException {
+		logger.Info("Creating user", "UserName", username)
 		_, err := svc.CreateUser(&iam.CreateUserInput{UserName: aws.String(username)})
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		return nil, err
-	}
 
-	policy := policyDocument{
-		Version: "2012-10-17",
-		Statement: []statementEntry{
-			statementEntry{
-				Effect: "Allow",
-				Action: []string{
-					"s3:ListBucket",
+		policy := policyDocument{
+			Version: "2012-10-17",
+			Statement: []statementEntry{
+				statementEntry{
+					Effect: "Allow",
+					Action: []string{
+						"s3:ListBucket",
+					},
+					Resource:  fmt.Sprintf("arn:aws:s3:::%s", bucket),
+					Condition: json.RawMessage(fmt.Sprintf(`{"StringLike":{"s3:prefix":["%s/*"]}}`, username)),
 				},
-				Resource:  fmt.Sprintf("arn:aws:s3:::%s", bucket),
-				Condition: json.RawMessage(fmt.Sprintf(`{"StringLike":{"s3:prefix":["%s/*"]}}`, username)),
-			},
-			statementEntry{
-				Effect: "Allow",
-				Action: []string{
-					"s3:PutObject",
-					"s3:GetObject",
-					"s3:DeleteObject",
+				statementEntry{
+					Effect: "Allow",
+					Action: []string{
+						"s3:PutObject",
+						"s3:GetObject",
+						"s3:DeleteObject",
+					},
+					Resource:  fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, username),
+					Condition: json.RawMessage(`{}`),
 				},
-				Resource:  fmt.Sprintf("arn:aws:s3:::%s/%s/*", bucket, username),
-				Condition: json.RawMessage(`{}`),
 			},
-		},
+		}
+
+		b, err := json.Marshal(&policy)
+		if err != nil {
+			return nil, err
+		}
+
+		policyResult, err := svc.CreatePolicy(&iam.CreatePolicyInput{
+			PolicyDocument: aws.String(string(b)),
+			PolicyName:     aws.String(fmt.Sprintf("%s-S3-Policy", username)),
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = svc.AttachUserPolicy(&iam.AttachUserPolicyInput{
+			UserName:  aws.String(username),
+			PolicyArn: policyResult.Policy.Arn,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	b, err := json.Marshal(&policy)
-	if err != nil {
-		return nil, err
-	}
-
-	policyResult, err := svc.CreatePolicy(&iam.CreatePolicyInput{
-		PolicyDocument: aws.String(string(b)),
-		PolicyName:     aws.String(fmt.Sprintf("%s-S3-Policy", username)),
+	logger.Info("Deleting existing keys for user", "UserName", username)
+	listAccessKeysOutput, _ := svc.ListAccessKeys(&iam.ListAccessKeysInput{
+		UserName: aws.String(username),
 	})
-	if err != nil {
-		return nil, err
+	if listAccessKeysOutput != nil && len(listAccessKeysOutput.AccessKeyMetadata) > 0 {
+		for _, accessKey := range listAccessKeysOutput.AccessKeyMetadata {
+			_, err := svc.DeleteAccessKey(&iam.DeleteAccessKeyInput{
+				AccessKeyId: accessKey.AccessKeyId,
+				UserName:    aws.String(username),
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
-	_, err = svc.AttachUserPolicy(&iam.AttachUserPolicyInput{
-		UserName:  aws.String(username),
-		PolicyArn: policyResult.Policy.Arn,
-	})
-	if err != nil {
-		return nil, err
-	}
-
+	logger.Info("Creating access key for user", "UserName", username)
 	accessKeyOutput, err := svc.CreateAccessKey(&iam.CreateAccessKeyInput{
 		UserName: aws.String(username),
 	})
