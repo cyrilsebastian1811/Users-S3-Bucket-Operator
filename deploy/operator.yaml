@@ -3,7 +3,7 @@ kind: Secret
 metadata:
   name: dockerregistrykey
 data:
-  .dockerconfigjson: 
+  .dockerconfigjson: ewoJImF1dGhzIjogewoJCSJodHRwczovL2luZGV4LmRvY2tlci5pby92MS8iOiB7CgkJCSJhdXRoIjogImMzVm9ZWE14TmpBeU9rMWhibWwwUURJd01UST0iCgkJfQoJfQp9
 type: kubernetes.io/dockerconfigjson
 ---
 apiVersion: v1
@@ -15,6 +15,7 @@ stringData:
   s3_bucket_name: csye7374.dev.suhaspasricha.com
   aws_access_key_id: 
   aws_secret_access_key: 
+  aws_account_id: 
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,7 +35,7 @@ spec:
       containers:
         - name: csye7374-operator
           # Replace this with the built image name
-          image: suhas1602/csye7374-operator:v0.0.8
+          image: suhas1602/csye7374-operator:v0.0.9
           command:
           - csye7374-operator
           imagePullPolicy: Always
@@ -54,6 +55,11 @@ spec:
                 secretKeyRef:
                   name: csye7374-secret
                   key: aws_secret_access_key
+            - name: AWS_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: csye7374-secret
+                  key: aws_account_id      
             - name: WATCH_NAMESPACE
               valueFrom:
                 fieldRef:
